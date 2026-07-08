@@ -1,8 +1,12 @@
 <?php
 // manager/daily.php
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
 requireRole('manager');
 $db = getDB();
+if (isset($_GET['read'])) {
+    markNotificationAsRead((int)$_GET['read']);
+}
 $pageTitle = 'Daily Sales Report';
 $activeNav = 'daily';
 

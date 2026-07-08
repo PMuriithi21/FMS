@@ -1,7 +1,24 @@
 <?php
 // manager/deliveries.php
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
 requireRole('manager');
+$db = getDB();
+
+if (isset($_GET['read'])) {
+    markNotificationAsRead((int)$_GET['read']);
+}
+
+
+$stmt = $db->prepare("
+UPDATE notifications
+SET is_read = 1
+WHERE recipient_role='manager'
+AND title='🚛 Delivery Received'
+");
+
+$stmt->execute();
+$stmt->close();
 $db = getDB();
 $pageTitle = 'Delivery Log';
 $activeNav = 'deliveries';

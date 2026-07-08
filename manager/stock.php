@@ -1,8 +1,13 @@
 <?php
 // manager/stock.php
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
 requireRole('manager');
 $db = getDB();
+
+if (isset($_GET['read'])) {
+    markNotificationAsRead((int)$_GET['read']);
+}
 $pageTitle = 'Stock Status';
 $activeNav = 'stock';
 

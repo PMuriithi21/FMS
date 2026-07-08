@@ -1,6 +1,7 @@
 <?php
 // supervisor/delivery.php
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
 requireRole('supervisor');
 $db  = getDB();
 $uid = $_SESSION['user_id'];
@@ -34,6 +35,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stk->bind_param('di', $volume_received, $fuel_id);
             $stk->execute();
             $stk->close();
+
+            // Get updated stock level
+$stmt = $db->prepare("
+SELECT
+    f.fuel_name,
+    s.current_volume
+FROM stock s
+JOIN fuel_types f
+ON s.fuel_id=f.fuel_id
+WHERE s.fuel_id=?
+");
+
+$stmt->bind_param("i",$fuel_id);
+$stmt->execute();
+
+$stock = $stmt->get_result()->fetch_assoc();
+
+$stmt->close();
+
+
+// Notify Admin
+createNotification(
+    "🚛 Delivery Received",
+    $volume_received." L of ".$stock['fuel_name'].
+    " received from ".$supplier.
+    ". Current stock: ".
+    number_format($stock['current_volume'],2)." L.",
+    "admin",
+    "delivery",
+    "success"
+);
+
+// Notify Manager
+createNotification(
+    "🚛 Delivery Received",
+    $volume_received." L of ".$stock['fuel_name'].
+    " received from ".$supplier.
+    ". Current stock: ".
+    number_format($stock['current_volume'],2)." L.",
+    "manager",
+    "delivery",
+    "success"
+);
 
             $db->commit();
             $success = '✅ Delivery logged successfully. Stock updated by ' . number_format($volume_received, 2) . ' L.';

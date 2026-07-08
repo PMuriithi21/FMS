@@ -5,6 +5,7 @@ requireRole('manager');
 $db    = getDB();
 $today = date('Y-m-d');
 $month = date('Y-m');
+[$year,$mon] = explode('-',$month);
 $pageTitle = 'Manager Dashboard';
 $activeNav = 'dashboard';
 
@@ -29,6 +30,52 @@ $stock = $db->query("SELECT f.fuel_name, COALESCE(s.current_volume,0) as vol FRO
 
 // Recent transactions
 $recent = $db->query("SELECT t.*, f.fuel_name, u.name as sup_name FROM transactions t JOIN fuel_types f ON t.fuel_id=f.fuel_id JOIN users u ON t.user_id=u.user_id ORDER BY t.created_at DESC LIMIT 8");
+
+// =====================================================
+// CHART DATA: Revenue trend (last 7 days)
+// =====================================================
+$trendStmt = $db->prepare("
+    SELECT trans_date, COALESCE(SUM(amount_paid),0) as rev, COALESCE(SUM(volume_sold),0) as vol
+    FROM transactions
+    WHERE trans_date >= DATE_SUB(?, INTERVAL 6 DAY)
+    GROUP BY trans_date
+    ORDER BY trans_date ASC
+");
+$trendStmt->bind_param('s', $today);
+$trendStmt->execute();
+$trendRaw = $trendStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$trendStmt->close();
+
+$trendMap = [];
+foreach ($trendRaw as $row) {
+    $trendMap[$row['trans_date']] = $row;
+}
+$trendLabels = [];
+$trendRevenue = [];
+for ($i = 6; $i >= 0; $i--) {
+    $d = date('Y-m-d', strtotime("-$i days", strtotime($today)));
+    $trendLabels[] = date('D d M', strtotime($d));
+    $trendRevenue[] = isset($trendMap[$d]) ? (float)$trendMap[$d]['rev'] : 0;
+}
+
+// =====================================================
+// CHART DATA: Fuel distribution (this month)
+// =====================================================
+$fuelDistStmt = $db->prepare("
+    SELECT f.fuel_name, COALESCE(SUM(t.volume_sold),0) as vol
+    FROM transactions t
+    JOIN fuel_types f ON t.fuel_id = f.fuel_id
+    WHERE YEAR(t.trans_date)=? AND MONTH(t.trans_date)=?
+    GROUP BY t.fuel_id
+    ORDER BY f.fuel_name
+");
+$fuelDistStmt->bind_param('ii', $year, $mon);
+$fuelDistStmt->execute();
+$fuelDist = $fuelDistStmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$fuelDistStmt->close();
+
+$fuelLabels = array_column($fuelDist, 'fuel_name');
+$fuelVolumes = array_map('floatval', array_column($fuelDist, 'vol'));
 
 include __DIR__ . '/../includes/header.php';
 ?>
@@ -61,6 +108,17 @@ include __DIR__ . '/../includes/header.php';
             <span class="stat-value"><?= $activeSups ?></span>
             <span class="stat-label">Supervisors Today</span>
         </div>
+    </div>
+</div>
+
+<div class="grid-2">
+    <div class="card">
+        <div class="card-title">📈 Revenue Trend (Last 7 Days)</div>
+        <canvas id="revenueTrendChart" style="max-height:280px;"></canvas>
+    </div>
+    <div class="card">
+        <div class="card-title">🥧 Fuel Sales Distribution (This Month)</div>
+        <canvas id="fuelDistChart" style="max-height:280px;"></canvas>
     </div>
 </div>
 
@@ -132,5 +190,53 @@ include __DIR__ . '/../includes/header.php';
         </table>
     </div>
 </div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script>
+const trendLabels = <?= json_encode($trendLabels) ?>;
+const trendRevenue = <?= json_encode($trendRevenue) ?>;
+
+new Chart(document.getElementById('revenueTrendChart'), {
+    type: 'line',
+    data: {
+        labels: trendLabels,
+        datasets: [{
+            label: 'Revenue (KES)',
+            data: trendRevenue,
+            borderColor: '#8b5e3c',
+            backgroundColor: 'rgba(139,94,60,0.1)',
+            tension: 0.3,
+            fill: true,
+            pointBackgroundColor: '#1a2744',
+            pointRadius: 4
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+            y: { beginAtZero: true, ticks: { callback: v => 'KES ' + v.toLocaleString() } }
+        }
+    }
+});
+
+const fuelLabels = <?= json_encode($fuelLabels) ?>;
+const fuelVolumes = <?= json_encode($fuelVolumes) ?>;
+
+new Chart(document.getElementById('fuelDistChart'), {
+    type: 'pie',
+    data: {
+        labels: fuelLabels,
+        datasets: [{
+            data: fuelVolumes,
+            backgroundColor: ['#1a2744', '#8b5e3c', '#d9c7a8', '#4a7c59', '#a63d40']
+        }]
+    },
+    options: {
+        responsive: true,
+        plugins: { legend: { position: 'bottom' } }
+    }
+});
+</script>
 
 <?php include __DIR__ . '/../includes/footer.php'; ?>

@@ -1,9 +1,14 @@
 <?php
 // admin/users.php
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
 requireRole('admin');
 
 $db = getDB();
+
+if (isset($_GET['read'])) {
+    markNotificationAsRead((int)$_GET['read']);
+}
 
 $pageTitle = 'User Management';
 $activeNav = 'users';
@@ -18,10 +23,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'add')
 
     $name     = trim($_POST['name'] ?? '');
     $username = trim($_POST['username'] ?? '');
+    $phone    = trim($_POST['phone'] ?? '');
+    $email    = trim($_POST['email'] ?? '');
     $password = trim($_POST['password'] ?? '');
     $role     = trim($_POST['role'] ?? '');
 
-    if (!$name || !$username || !$password || !$role) {
+    if (!$name || !$username || !$phone || !$password || !$role) {
 
         $error = 'All fields are required.';
 
@@ -29,19 +36,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'add')
 
         $hash = password_hash($password, PASSWORD_BCRYPT);
 
-        $stmt = $db->prepare("INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)");
+        $stmt = $db->prepare("INSERT INTO users (name, username, phone, email, password, role) VALUES (?, ?, ?, ?, ?, ?)");
 
         if ($stmt) {
 
-            $stmt->bind_param("ssss", $name, $username, $hash, $role);
+            $stmt->bind_param("ssssss", $name, $username, $phone, $email, $hash, $role);
 
-            if ($stmt->execute()) {
-                $success = "User '$username' created successfully.";
-            } else {
-                $error = "Username already exists.";
-            }
+try {
+    $stmt->execute();
+    $success = "User '$username' created successfully.";
+} catch (mysqli_sql_exception $e) {
+    if (str_contains($e->getMessage(), 'Duplicate entry')) {
+        $error = "Username already exists.";
+    } else {
+        $error = "Database error: " . $e->getMessage();
+    }
+}
 
-            $stmt->close();
+$stmt->close();
 
         } else {
             $error = "Database error: " . $db->error;
@@ -114,6 +126,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'reset
     }
 }
 
+// =====================================================
+// UPDATE EMAIL
+// =====================================================
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'update_email') {
+
+    $uid2 = (int)($_POST['uid'] ?? 0);
+    $newEmail = trim($_POST['email'] ?? '');
+
+    $stmt = $db->prepare("UPDATE users SET email = ? WHERE user_id = ?");
+
+    if ($stmt) {
+
+        $stmt->bind_param("si", $newEmail, $uid2);
+
+        if ($stmt->execute()) {
+            $success = "Email updated successfully.";
+        } else {
+            $error = "Failed to update email.";
+        }
+
+        $stmt->close();
+
+    } else {
+        $error = "Database error: " . $db->error;
+    }
+}
+
 $users = $db->query("SELECT * FROM users ORDER BY role, name");
 
 include __DIR__ . '/../includes/header.php';
@@ -144,6 +183,25 @@ include __DIR__ . '/../includes/header.php';
             <div class="form-group">
                 <label>Username *</label>
                 <input type="text" name="username" class="form-control" placeholder="e.g. jane.mwangi" required>
+            </div>
+
+            <div class="form-group">
+                <label>Phone Number *</label>
+                <input
+                    type="text"
+                    name="phone"
+                    class="form-control"
+                    placeholder="+254712345678"
+                    required>
+            </div>
+
+            <div class="form-group">
+                <label>Email Address</label>
+                <input
+                    type="email"
+                    name="email"
+                    class="form-control"
+                    placeholder="jane@example.com">
             </div>
 
             <div class="form-group">
@@ -240,6 +298,8 @@ include __DIR__ . '/../includes/header.php';
                 <th>Status</th>
                 <th>Created</th>
                 <th>Action</th>
+                <th>Phone</th>
+                <th>Email</th>
             </tr>
 
             </thead>
@@ -292,6 +352,23 @@ include __DIR__ . '/../includes/header.php';
 
                         </form>
 
+                    </td>
+
+                    <td><?= clean($row['phone']) ?></td>
+
+                    <td>
+                        <form method="POST" style="display:flex;gap:6px;align-items:center;">
+                            <input type="hidden" name="action" value="update_email">
+                            <input type="hidden" name="uid" value="<?= $row['user_id'] ?>">
+                            <input
+                                type="email"
+                                name="email"
+                                value="<?= clean($row['email'] ?? '') ?>"
+                                class="form-control"
+                                style="min-width:160px;font-size:12px;padding:4px 8px;"
+                                placeholder="email@example.com">
+                            <button type="submit" class="btn btn-sm btn-brown">Save</button>
+                        </form>
                     </td>
 
                 </tr>

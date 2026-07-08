@@ -1,8 +1,14 @@
 <?php
 // admin/stock.php
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
+
 requireRole('admin');
 $db = getDB();
+
+if (isset($_GET['read'])) {
+    markNotificationAsRead((int)$_GET['read']);
+}
 $pageTitle = 'Stock Management';
 $activeNav = 'stock';
 $success = $error = '';

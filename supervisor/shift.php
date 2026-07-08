@@ -1,278 +1,1000 @@
 <?php
-// supervisor/shift.php  — meter-based shift entry
 require_once __DIR__ . '/../includes/config.php';
+require_once __DIR__ . '/../includes/notification_helper.php';
+
 requireRole('supervisor');
-$db    = getDB();
-$uid   = $_SESSION['user_id'];
+$db = getDB();
+$uid = $_SESSION['user_id'];
 $today = date('Y-m-d');
-$pageTitle = 'Shift & Meter Entry';
-$activeNav = 'shift';
+$pageTitle = "Shift Entry";
+$activeNav = "shift";
+$success = "";
+$error = "";
 
-$success = $error = '';
+// =====================================
+// CHECK IF SHIFT EXISTS (open shift only)
+// =====================================
 
-// ── Handle START SHIFT ────────────────────────────────────────
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'start_shift') {
-    $fuel_id       = (int)($_POST['fuel_id'] ?? 0);
-    $opening_meter = trim($_POST['opening_meter'] ?? '');
+$shift = null;
+$stmt = $db->prepare("
+SELECT *
+FROM shifts
+WHERE user_id=?
+AND shift_date=?
+AND status='open'
+ORDER BY shift_id DESC
+LIMIT 1
+");
 
-    if (!$fuel_id || $opening_meter === '') {
-        $error = 'Please select a fuel type and enter the opening meter reading.';
-    } else {
-        // Check no open shift for this fuel today
-        $chk = $db->prepare("SELECT shift_id FROM shifts WHERE user_id=? AND fuel_id=? AND shift_date=? AND status='open' LIMIT 1");
-        $chk->bind_param('iis', $uid, $fuel_id, $today);
-        $chk->execute();
-        if ($chk->get_result()->num_rows > 0) {
-            $error = 'You already have an open shift for this fuel type today. Close it first.';
-        } else {
-            $stmt = $db->prepare("INSERT INTO shifts (user_id, fuel_id, shift_date, opening_meter, status) VALUES (?,?,?,?,'open')");
-            $stmt->bind_param('iisd', $uid, $fuel_id, $today, $opening_meter);
-            $stmt->execute();
-            $stmt->close();
-            $success = '✅ Shift started. Opening meter recorded: ' . number_format($opening_meter, 2) . ' L';
+$stmt->bind_param("is",$uid,$today);
+$stmt->execute();
+$shift = $stmt->get_result()->fetch_assoc();
+$stmt->close();
+
+// =====================================
+// START SHIFT
+// =====================================
+
+if(
+    $_SERVER['REQUEST_METHOD']=="POST"
+    &&
+    ($_POST['action'] ?? "")=="start_shift"
+){
+    if($shift){
+        $error="Today's shift already exists.";
+    }else{
+        $stmt=$db->prepare("
+        INSERT INTO shifts
+        (
+            user_id,
+            shift_date,
+            opening_meter,
+            status
+        )
+        VALUES
+        (
+            ?,
+            ?,
+            0,
+            'open'
+        )
+        ");
+        $stmt->bind_param(
+            "is",
+            $uid,
+            $today
+        );
+        $stmt->execute();
+        $shift_id=$stmt->insert_id;
+        $stmt->close();
+
+        // =============================
+        // Create empty records
+        // for every active fuel
+        // =============================
+
+        $fuels=$db->query("
+        SELECT *
+        FROM fuel_types
+        WHERE status='active'
+        ORDER BY fuel_name
+        ");
+
+        while($fuel=$fuels->fetch_assoc()){
+            $sale=$db->prepare("
+            INSERT INTO shift_sales
+            (
+                shift_id,
+                fuel_id,
+                opening_meter,
+                closing_meter,
+                volume_sold,
+                amount
+            )
+            VALUES
+            (
+                ?,
+                ?,
+                0,
+                0,
+                0,
+                0
+            )
+            ");
+
+            $sale->bind_param(
+                "ii",
+                $shift_id,
+                $fuel['fuel_id']
+            );
+
+            $sale->execute();
+            $sale->close();
+
         }
-        $chk->close();
+
+        header("Location: shift.php");
+        exit();
     }
+
 }
 
-// ── Handle CLOSE SHIFT ────────────────────────────────────────
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'close_shift') {
-    $shift_id      = (int)($_POST['shift_id'] ?? 0);
-    $closing_meter = trim($_POST['closing_meter'] ?? '');
-    $amount_paid   = trim($_POST['amount_paid'] ?? '');
+// =====================================
+// RELOAD SHIFT (open shift only)
+// =====================================
 
-    if (!$shift_id || $closing_meter === '' || $amount_paid === '') {
-        $error = 'Please fill in all fields to close the shift.';
-    } else {
-        // Get opening meter to validate
-        $s = $db->prepare("SELECT opening_meter, fuel_id FROM shifts WHERE shift_id=? AND user_id=? AND status='open' LIMIT 1");
-        $s->bind_param('ii', $shift_id, $uid);
-        $s->execute();
-        $shiftRow = $s->get_result()->fetch_assoc();
-        $s->close();
+$stmt=$db->prepare("
+SELECT *
+FROM shifts
+WHERE user_id=?
+AND shift_date=?
+AND status='open'
+ORDER BY shift_id DESC
+LIMIT 1
+");
 
-        if (!$shiftRow) {
-            $error = 'Shift not found or already closed.';
-        } elseif ($closing_meter < $shiftRow['opening_meter']) {
-            $error = 'Closing meter cannot be less than opening meter (' . number_format($shiftRow['opening_meter'], 2) . ').';
-        } else {
-            $volume_sold = $closing_meter - $shiftRow['opening_meter'];
+$stmt->bind_param(
+"is",
+$uid,
+$today
+);
 
-            // Begin transaction
-            $db->begin_transaction();
-            try {
-                // Close shift
-                $upd = $db->prepare("UPDATE shifts SET closing_meter=?, status='closed', closed_at=NOW() WHERE shift_id=?");
-                $upd->bind_param('di', $closing_meter, $shift_id);
-                $upd->execute();
-                $upd->close();
+$stmt->execute();
+$shift=$stmt->get_result()->fetch_assoc();
+$stmt->close();
 
-                // Insert transaction record
-                $ins = $db->prepare("INSERT INTO transactions (shift_id, user_id, fuel_id, opening_meter, closing_meter, amount_paid, trans_date) VALUES (?,?,?,?,?,?,?)");
-                $ins->bind_param('iiiddds', $shift_id, $uid, $shiftRow['fuel_id'], $shiftRow['opening_meter'], $closing_meter, $amount_paid, $today);
-                $ins->execute();
-                $ins->close();
+// =====================================
+// SAVE SHIFT
+// =====================================
 
-                // Deduct from stock
-                $stk = $db->prepare("UPDATE stock SET current_volume = current_volume - ? WHERE fuel_id=? AND current_volume >= ?");
-                $stk->bind_param('did', $volume_sold, $shiftRow['fuel_id'], $volume_sold);
-                $stk->execute();
-                if ($db->affected_rows === 0) {
-                    throw new Exception('Insufficient stock to deduct ' . number_format($volume_sold, 2) . ' L.');
-                }
-                $stk->close();
+if (
+    $_SERVER['REQUEST_METHOD'] == "POST"
+    &&
+    ($_POST['action'] ?? "") == "save_shift"
+) {
 
-                $db->commit();
-                $success = '✅ Shift closed. Volume sold: ' . number_format($volume_sold, 2) . ' L | Revenue: KES ' . number_format($amount_paid, 2);
-            } catch (Exception $e) {
-                $db->rollback();
-                $error = '⚠️ ' . $e->getMessage();
+    $fuelIds = $_POST['fuel_id'];
+    $opening = $_POST['opening_meter'];
+    $closing = $_POST['closing_meter'];
+    $prices  = $_POST['price'];
+
+    $cash  = (double)$_POST['cash'];
+    $mpesa = (double)$_POST['mpesa'];
+
+    $expectedTotal = 0;
+
+    $db->begin_transaction();
+
+    try {
+
+        for ($i = 0; $i < count($fuelIds); $i++) {
+
+            $fuel_id = (int)$fuelIds[$i];
+
+            $open = (double)$opening[$i];
+
+            $close = (double)$closing[$i];
+
+            $price = (double)$prices[$i];
+
+            if ($close < $open) {
+
+                throw new Exception(
+                    "Closing meter cannot be less than opening meter."
+                );
+
             }
+
+            $litres = $close - $open;
+
+            $expected = $litres * $price;
+
+            $expectedTotal += $expected;
+
+            $stmt = $db->prepare("
+                UPDATE shift_sales
+                SET
+
+                opening_meter=?,
+
+                closing_meter=?,
+
+                volume_sold=?,
+
+                amount=?
+
+                WHERE shift_id=?
+
+                AND fuel_id=?
+            ");
+
+            $stmt->bind_param(
+
+                "ddddii",
+
+                $open,
+
+                $close,
+
+                $litres,
+
+                $expected,
+
+                $shift['shift_id'],
+
+                $fuel_id
+
+            );
+
+            $stmt->execute();
+
+            $stmt->close();
+
         }
+
+        $received = $cash + $mpesa;
+
+        $variance = $received - $expectedTotal;
+
+        $stmt = $db->prepare("
+
+            UPDATE shifts
+
+            SET
+
+            cash_at_hand=?,
+
+            mpesa=?,
+
+            expected_amount=?,
+
+            variance=?
+
+            WHERE shift_id=?
+
+        ");
+
+        $stmt->bind_param(
+
+            "ddddi",
+
+            $cash,
+
+            $mpesa,
+
+            $expectedTotal,
+
+            $variance,
+
+            $shift['shift_id']
+
+        );
+
+        $stmt->execute();
+
+        $stmt->close();
+
+        $db->commit();
+
+        $success = "Shift saved successfully.";
+
+        // Reload shift so page shows fresh totals
+        $stmt = $db->prepare("
+        SELECT *
+        FROM shifts
+        WHERE shift_id=?
+        LIMIT 1
+        ");
+        $stmt->bind_param("i", $shift['shift_id']);
+        $stmt->execute();
+        $shift = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+    }
+
+    catch(Exception $e){
+
+        $db->rollback();
+
+        $error = $e->getMessage();
+
+    }
+
+}
+
+// =====================================
+// CLOSE SHIFT
+// =====================================
+
+if (
+    $_SERVER['REQUEST_METHOD'] == "POST"
+    &&
+    ($_POST['action'] ?? "") == "close_shift"
+) {
+
+    $db->begin_transaction();
+
+    try {
+
+        // Reload all fuel sales for this shift
+            $stmt = $db->prepare("
+    SELECT ss.*, f.fuel_name
+    FROM shift_sales ss
+    JOIN fuel_types f ON ss.fuel_id = f.fuel_id
+    WHERE ss.shift_id=?
+");
+        $stmt->bind_param(
+            "i",
+            $shift['shift_id']
+        );
+
+        $stmt->execute();
+
+        $sales = $stmt->get_result();
+
+        while($sale = $sales->fetch_assoc()){
+
+            // -------------------------
+            // Insert transaction record
+            // -------------------------
+
+            $tr = $db->prepare("
+                INSERT INTO transactions
+                (
+                    shift_id,
+                    user_id,
+                    fuel_id,
+                    opening_meter,
+                    closing_meter,
+                    volume_sold,
+                    amount_paid,
+                    trans_date
+                )
+                VALUES
+                (
+                    ?,?,?,?,?,?,?,?
+                )
+            ");
+
+            $tr->bind_param(
+
+                "iiidddds",
+
+                $shift['shift_id'],
+
+                $uid,
+
+                $sale['fuel_id'],
+
+                $sale['opening_meter'],
+
+                $sale['closing_meter'],
+
+                $sale['volume_sold'],
+
+                $sale['amount'],
+
+                $today
+
+            );
+
+            $tr->execute();
+
+            $tr->close();
+
+
+            // -------------------------
+            // Deduct Stock (with insufficient-stock guard)
+            // -------------------------
+
+            $stk = $db->prepare("
+                UPDATE stock
+
+                SET current_volume =
+                current_volume - ?
+
+                WHERE fuel_id=?
+
+                AND current_volume >= ?
+            ");
+
+            $stk->bind_param(
+
+                "did",
+
+                $sale['volume_sold'],
+
+                $sale['fuel_id'],
+
+                $sale['volume_sold']
+
+            );
+
+            $stk->execute();
+
+            if ($db->affected_rows === 0) {
+throw new Exception(
+    "Insufficient stock to deduct " .
+    number_format($sale['volume_sold'], 2) .
+    " L of " . $sale['fuel_name'] . "."
+);
+            }
+
+            $stk->close();
+
+
+            // -------------------------
+            // Check remaining stock
+            // -------------------------
+
+            $check = $db->prepare("
+                SELECT
+
+                s.current_volume,
+
+                f.fuel_name
+
+                FROM stock s
+
+                JOIN fuel_types f
+
+                ON s.fuel_id=f.fuel_id
+
+                WHERE s.fuel_id=?
+            ");
+
+            $check->bind_param(
+                "i",
+                $sale['fuel_id']
+            );
+
+            $check->execute();
+
+            $stock = $check->get_result()->fetch_assoc();
+
+            $check->close();
+
+
+            // -------------------------
+            // LOW STOCK ALERT
+            // -------------------------
+
+            if($stock['current_volume'] <= 500){
+
+                createNotification(
+
+                    "⚠ Low Stock",
+
+                    $stock['fuel_name'] .
+                    " has only " .
+                    number_format(
+                        $stock['current_volume'],
+                        2
+                    ) .
+                    " L remaining.",
+
+                    "admin",
+
+                    "low_stock",
+
+                    "danger"
+
+                );
+
+                createNotification(
+
+                    "⚠ Low Stock",
+
+                    $stock['fuel_name'] .
+                    " has only " .
+                    number_format(
+                        $stock['current_volume'],
+                        2
+                    ) .
+                    " L remaining.",
+
+                    "manager",
+
+                    "low_stock",
+
+                    "danger"
+
+                );
+
+            }
+
+        }
+
+
+        // -------------------------
+        // Close shift
+        // -------------------------
+
+        $stmt = $db->prepare("
+            UPDATE shifts
+
+            SET
+
+            status='closed',
+
+            closed_at=NOW()
+
+            WHERE shift_id=?
+        ");
+
+        $stmt->bind_param(
+
+            "i",
+
+            $shift['shift_id']
+
+        );
+
+        $stmt->execute();
+
+        $stmt->close();
+
+        // -------------------------
+        // Report notification
+        // -------------------------
+        createNotification(
+            "📋 Daily Report Updated",
+            "A supervisor has completed today's shift.",
+            "manager",
+            "report",
+            "info"
+        );
+        createNotification(
+            "📋 Daily Report Updated",
+            "A supervisor has completed today's shift.",
+            "admin",
+            "report",
+            "info"
+        );
+
+        // -------------------------
+        // Future SMS Hook
+        // -------------------------
+        /*
+        sendDailySMSReport(
+            $shift['shift_id']
+        );
+        */
+
+        $db->commit();
+
+        $success =
+        "✅ Shift closed successfully.";
+
+        header("Location: shift.php");
+        exit();
+    }
+    catch(Exception $e){
+        $db->rollback();
+        $error = $e->getMessage();
     }
 }
 
-// ── Load data ─────────────────────────────────────────────────
-// Fuel types
-$fuels = $db->query("SELECT f.fuel_id, f.fuel_name, f.unit_price, COALESCE(s.current_volume,0) as stock_vol FROM fuel_types f LEFT JOIN stock s ON f.fuel_id=s.fuel_id WHERE f.status='active' ORDER BY f.fuel_name");
-$fuelList = $fuels->fetch_all(MYSQLI_ASSOC);
+// =====================================
+// LOAD FUELS
+// =====================================
 
-// Open shifts today
-$os = $db->prepare("SELECT s.*, f.fuel_name FROM shifts s JOIN fuel_types f ON s.fuel_id=f.fuel_id WHERE s.user_id=? AND s.shift_date=? AND s.status='open'");
-$os->bind_param('is', $uid, $today);
-$os->execute();
-$openShifts = $os->get_result()->fetch_all(MYSQLI_ASSOC);
-$os->close();
+$fuelSales=[];
+if($shift){
+$stmt=$db->prepare("
+SELECT
+ss.*,
+f.fuel_name,
+f.unit_price
+FROM shift_sales ss
+JOIN fuel_types f
+ON ss.fuel_id=f.fuel_id
+WHERE ss.shift_id=?
+ORDER BY f.fuel_name
+");
 
-include __DIR__ . '/../includes/header.php';
+$stmt->bind_param(
+"i",
+$shift['shift_id']
+);
+$stmt->execute();
+$fuelSales=$stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt->close();
+
+}
+
+include __DIR__.'/../includes/header.php';
+?>
+<?php if($success): ?>
+<div class="alert alert-success">
+<?= $success ?>
+</div>
+<?php endif; ?>
+
+<?php if($error): ?>
+<div class="alert alert-error">
+<?= clean($error) ?>
+</div>
+
+<?php endif; ?>
+
+<div class="card">
+
+    <div class="card-title">
+        ⛽ Today's Shift
+    </div>
+
+<?php if(!$shift): ?>
+
+    <div style="padding:30px;text-align:center;">
+
+        <p style="margin-bottom:20px;">
+            No shift has been started today.
+        </p>
+
+        <form method="POST">
+
+            <input
+                type="hidden"
+                name="action"
+                value="start_shift">
+
+            <button class="btn btn-primary">
+
+                ▶ Start Shift
+
+            </button>
+
+        </form>
+
+    </div>
+
+<?php else: ?>
+
+<?php
+$receivedNow = (float)$shift['cash_at_hand'] + (float)$shift['mpesa'];
+$varianceNow = $receivedNow - (float)$shift['expected_amount'];
 ?>
 
-<?php if ($success): ?><div class="alert alert-success"><?= $success ?></div><?php endif; ?>
-<?php if ($error):   ?><div class="alert alert-error"><?= clean($error) ?></div><?php endif; ?>
+<form method="POST" id="shiftForm">
+
+<input
+type="hidden"
+name="action"
+value="save_shift">
+
+<div class="table-wrap">
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>Fuel</th>
+
+<th>Opening Meter</th>
+
+<th>Closing Meter</th>
+
+<th>Litres Sold</th>
+
+<th>Price/Litre</th>
+
+<th>Expected (KES)</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+<?php foreach($fuelSales as $fuel): ?>
+
+<tr>
+
+<td>
+
+<strong>
+
+<?= clean($fuel['fuel_name']) ?>
+
+</strong>
+
+<input
+type="hidden"
+name="fuel_id[]"
+value="<?= $fuel['fuel_id'] ?>">
+
+</td>
+
+<td>
+
+<input
+
+type="number"
+
+step="0.01"
+
+class="form-control opening"
+
+name="opening_meter[]"
+
+value="<?= $fuel['opening_meter'] ?>"
+
+oninput="recalcRow(this)"
+
+>
+
+</td>
+
+<td>
+
+<input
+
+type="number"
+
+step="0.01"
+
+class="form-control closing"
+
+name="closing_meter[]"
+
+value="<?= $fuel['closing_meter'] ?>"
+
+oninput="recalcRow(this)"
+
+>
+
+</td>
+
+<td>
+
+<input
+
+type="text"
+
+readonly
+
+class="form-control litres"
+
+value="<?= number_format($fuel['volume_sold'],2) ?>"
+
+>
+
+</td>
+
+<td>
+
+<input
+
+type="text"
+
+readonly
+
+class="form-control price"
+
+value="<?= number_format($fuel['unit_price'],2) ?>"
+
+>
+
+<input
+
+type="hidden"
+
+name="price[]"
+
+value="<?= $fuel['unit_price'] ?>"
+
+>
+
+</td>
+
+<td>
+
+<input
+
+type="text"
+
+readonly
+
+class="form-control expected"
+
+value="<?= number_format($fuel['amount'],2) ?>"
+
+>
+
+</td>
+
+</tr>
+
+<?php endforeach; ?>
+
+</tbody>
+
+</table>
+
+</div>
+
+<hr style="margin:35px 0;">
 
 <div class="grid-2">
 
-    <!-- ── START SHIFT ── -->
-    <div class="card">
-        <div class="card-title">⏱ Start Shift — Opening Meter</div>
-        <p style="font-size:13px;color:var(--text-light);margin-bottom:20px;">
-            Select the fuel type and enter the pump meter reading at the <strong>start of your shift</strong>.
-        </p>
-        <form method="POST">
-            <input type="hidden" name="action" value="start_shift"/>
+<div class="form-group">
 
-            <div class="form-group">
-                <label>Select Fuel Type</label>
-                <div class="fuel-selector" id="fuelSelector">
-                    <?php foreach($fuelList as $f): ?>
-                    <div class="fuel-btn" onclick="selectFuel(<?= $f['fuel_id'] ?>, this)">
-                        <div class="fuel-name">⛽ <?= clean($f['fuel_name']) ?></div>
-                        <div class="fuel-stock"><?= number_format($f['stock_vol'], 0) ?> L in tank</div>
-                    </div>
-                    <?php endforeach; ?>
-                </div>
-                <input type="hidden" name="fuel_id" id="selectedFuel" value=""/>
-            </div>
+<label>
 
-            <div class="meter-display">
-                <div>
-                    <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:0.7;">Opening Meter Reading</div>
-                    <div class="meter-val" id="meterPreview">0.00</div>
-                </div>
-                <div style="opacity:0.5;font-size:28px;">L</div>
-            </div>
+💵 Cash at Hand
 
-            <div class="form-group">
-                <label for="opening_meter">Opening Meter Reading (Litres)</label>
-                <input type="number" step="0.01" min="0" id="opening_meter" name="opening_meter"
-                       class="form-control" placeholder="e.g. 10450.00"
-                       oninput="document.getElementById('meterPreview').textContent=parseFloat(this.value||0).toFixed(2)"/>
-            </div>
+</label>
 
-            <button type="submit" class="btn btn-primary btn-block">▶ Start Shift</button>
-        </form>
-    </div>
+<input
 
-    <!-- ── CLOSE SHIFT ── -->
-    <div class="card">
-        <div class="card-title">🏁 Close Shift — Closing Meter</div>
-        <?php if (empty($openShifts)): ?>
-        <div class="alert alert-warning">No open shifts to close today. Start a shift first.</div>
-        <?php else: ?>
-        <p style="font-size:13px;color:var(--text-light);margin-bottom:20px;">
-            Select an open shift and enter the pump meter reading at the <strong>end of your shift</strong>.
-            The system will automatically calculate volume sold.
-        </p>
-        <form method="POST">
-            <input type="hidden" name="action" value="close_shift"/>
+type="number"
 
-            <div class="form-group">
-                <label>Select Open Shift</label>
-                <select name="shift_id" class="form-control" onchange="updateOpeningDisplay(this)" required>
-                    <option value="">— Select shift to close —</option>
-                    <?php foreach($openShifts as $os): ?>
-                    <option value="<?= $os['shift_id'] ?>" data-opening="<?= $os['opening_meter'] ?>">
-                        <?= clean($os['fuel_name']) ?> — Opening: <?= number_format($os['opening_meter'], 2) ?> L
-                    </option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
+step="0.01"
 
-            <div class="meter-display" id="closeDisplay" style="display:none;">
-                <div>
-                    <div style="font-size:11px;opacity:0.7;text-transform:uppercase;letter-spacing:1px;">Opening Meter</div>
-                    <div class="meter-val" id="openingVal">—</div>
-                </div>
-                <div style="font-size:24px;opacity:0.4;">→</div>
-                <div>
-                    <div style="font-size:11px;opacity:0.7;text-transform:uppercase;letter-spacing:1px;">Closing Meter</div>
-                    <div class="meter-val" id="closingVal">0.00</div>
-                </div>
-                <div>
-                    <div style="font-size:11px;opacity:0.7;text-transform:uppercase;letter-spacing:1px;">Volume Sold</div>
-                    <div class="meter-val" id="volSold" style="color:var(--nude-dark);">0.00</div>
-                </div>
-            </div>
+name="cash"
 
-            <div class="form-group">
-                <label for="closing_meter">Closing Meter Reading (Litres)</label>
-                <input type="number" step="0.01" min="0" id="closing_meter" name="closing_meter"
-                       class="form-control" placeholder="e.g. 10820.00"
-                       oninput="calcVolume()"/>
-            </div>
+id="cash"
 
-            <div class="form-group">
-                <label for="amount_paid">Total Cash Collected (KES)</label>
-                <input type="number" step="0.01" min="0" id="amount_paid" name="amount_paid"
-                       class="form-control" placeholder="e.g. 81130.00"/>
-            </div>
+class="form-control"
 
-            <button type="submit" class="btn btn-brown btn-block">🏁 Close Shift & Save</button>
-        </form>
-        <?php endif; ?>
-    </div>
+value="<?= $shift['cash_at_hand'] ?>"
+
+oninput="recalcTotals()">
 
 </div>
 
-<!-- Today's shifts -->
-<div class="card">
-    <div class="card-title">📋 Today's Shifts</div>
-    <?php
-    $ts = $db->prepare("SELECT s.*, f.fuel_name FROM shifts s JOIN fuel_types f ON s.fuel_id=f.fuel_id WHERE s.user_id=? AND s.shift_date=? ORDER BY s.created_at DESC");
-    $ts->bind_param('is', $uid, $today);
-    $ts->execute();
-    $todayShifts = $ts->get_result();
-    $ts->close();
-    if ($todayShifts->num_rows === 0):
-    ?>
-    <p style="color:var(--text-light);text-align:center;padding:20px;">No shifts recorded today yet.</p>
-    <?php else: ?>
-    <div class="table-wrap">
-        <table>
-            <thead>
-                <tr><th>Fuel</th><th>Opening Meter</th><th>Closing Meter</th><th>Volume Sold (L)</th><th>Status</th><th>Opened At</th></tr>
-            </thead>
-            <tbody>
-                <?php while($row = $todayShifts->fetch_assoc()): ?>
-                <tr>
-                    <td>⛽ <?= clean($row['fuel_name']) ?></td>
-                    <td><?= number_format($row['opening_meter'], 2) ?></td>
-                    <td><?= $row['closing_meter'] ? number_format($row['closing_meter'], 2) : '—' ?></td>
-                    <td style="font-weight:700;color:var(--brown);"><?= $row['closing_meter'] ? number_format($row['closing_meter'] - $row['opening_meter'], 2) : '—' ?></td>
-                    <td><span class="badge badge-<?= $row['status'] ?>"><?= ucfirst($row['status']) ?></span></td>
-                    <td style="font-size:12px;color:var(--text-light);"><?= $row['created_at'] ?></td>
-                </tr>
-                <?php endwhile; ?>
-            </tbody>
-        </table>
-    </div>
-    <?php endif; ?>
+<div class="form-group">
+
+<label>
+
+📱 M-Pesa
+
+</label>
+
+<input
+
+type="number"
+
+step="0.01"
+
+name="mpesa"
+
+id="mpesa"
+
+class="form-control"
+
+value="<?= $shift['mpesa'] ?>"
+
+oninput="recalcTotals()">
+
+</div>
+
+</div>
+
+<div class="grid-3">
+
+<div class="form-group">
+
+<label>
+
+Expected Total
+
+</label>
+
+<input
+
+readonly
+
+id="expected_total"
+
+class="form-control"
+
+value="<?= number_format($shift['expected_amount'],2) ?>">
+
+</div>
+
+<div class="form-group">
+
+<label>
+
+Received
+
+</label>
+
+<input
+
+readonly
+
+id="received"
+
+class="form-control"
+
+value="<?= number_format($receivedNow,2) ?>">
+
+</div>
+
+<div class="form-group">
+
+<label>
+
+Variance
+
+</label>
+
+<input
+
+readonly
+
+id="variance"
+
+class="form-control"
+
+value="<?= number_format($varianceNow,2) ?>">
+
+</div>
+
+</div>
+
+<br>
+
+<button
+
+class="btn btn-primary btn-block">
+
+💾 Save Shift
+
+</button>
+
+</form>
+
+<form method="POST" style="margin-top:15px;" onsubmit="return confirm('Close this shift? This cannot be undone.');">
+<input type="hidden" name="action" value="close_shift">
+<button class="btn btn-brown btn-block">🏁 Close Shift</button>
+</form>
+
+<?php endif; ?>
+
 </div>
 
 <script>
-function selectFuel(id, el) {
-    document.querySelectorAll('.fuel-btn').forEach(b => b.classList.remove('selected'));
-    el.classList.add('selected');
-    document.getElementById('selectedFuel').value = id;
-}
-function updateOpeningDisplay(sel) {
-    const opt = sel.options[sel.selectedIndex];
-    const opening = opt.dataset.opening;
-    if (opening) {
-        document.getElementById('closeDisplay').style.display = 'flex';
-        document.getElementById('openingVal').textContent = parseFloat(opening).toFixed(2);
-        calcVolume();
-    }
-}
-function calcVolume() {
-    const sel = document.querySelector('[name="shift_id"]');
-    const opt = sel ? sel.options[sel.selectedIndex] : null;
-    const opening = opt ? parseFloat(opt.dataset.opening || 0) : 0;
-    const closing = parseFloat(document.getElementById('closing_meter').value || 0);
-    const vol = Math.max(0, closing - opening);
-    document.getElementById('closingVal').textContent = closing.toFixed(2);
-    document.getElementById('volSold').textContent = vol.toFixed(2);
-}
-</script>
+function recalcRow(el) {
+    const row = el.closest('tr');
+    const opening = parseFloat(row.querySelector('.opening').value || 0);
+    const closing = parseFloat(row.querySelector('.closing').value || 0);
+    const price = parseFloat(row.querySelector('.price').value || 0);
 
-<?php include __DIR__ . '/../includes/footer.php'; ?>
+    const litres = Math.max(0, closing - opening);
+    const expected = litres * price;
+
+    row.querySelector('.litres').value = litres.toFixed(2);
+    row.querySelector('.expected').value = expected.toFixed(2);
+
+    recalcTotals();
+}
+
+function recalcTotals() {
+    let expectedTotal = 0;
+
+    document.querySelectorAll('.expected').forEach(function(el) {
+        expectedTotal += parseFloat(el.value || 0);
+    });
+
+    const cash = parseFloat(document.getElementById('cash').value || 0);
+    const mpesa = parseFloat(document.getElementById('mpesa').value || 0);
+    const received = cash + mpesa;
+    const variance = received - expectedTotal;
+
+    document.getElementById('expected_total').value = expectedTotal.toFixed(2);
+    document.getElementById('received').value = received.toFixed(2);
+    document.getElementById('variance').value = variance.toFixed(2);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('.opening, .closing').forEach(function(input) {
+        recalcRow(input);
+    });
+});
+</script>
